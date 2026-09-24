@@ -2,19 +2,32 @@
 
 import argparse
 import asyncio
+import getpass
 from pathlib import Path
 import re
 import sys
 import threading
-from urllib.parse import urlsplit
+import warnings
+from urllib.parse import urljoin, urlsplit
 
 from playwright.async_api import Error, TimeoutError as PlaywrightTimeout, async_playwright
+
+from credential_store import CredentialStore
 
 
 DOWNLOAD_LABEL = re.compile(r"download|下載|下载", re.IGNORECASE)
 
 
-async def prompt(message):
+async def prompt(message, secret=False):
+    if secret:
+        # Read on the main thread so getpass can restore terminal echo on Ctrl-C.
+        # No downloads run while a password is requested.
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                return getpass.getpass(message)
+        except getpass.GetPassWarning:
+            raise ValueError("Hidden password input requires an interactive terminal.") from None
     # Process browser events while reading input; a daemon thread also lets Ctrl-C
     # exit without waiting for a blocked executor input() call to finish.
     loop = asyncio.get_running_loop()
@@ -43,6 +56,12 @@ async def prompt(message):
 
 
 def validate_url(value):
+    value = value.strip()
+    markdown = re.fullmatch(r"\[[^\]]*\]\((https?://.+)\)", value)
+    if markdown:
+        value = markdown.group(1)
+    elif value.startswith("<") and value.endswith(">"):
+        value = value[1:-1]
     parts = urlsplit(value)
     if parts.scheme not in {"http", "https"} or not parts.hostname:
         raise ValueError("Paste a complete http:// or https:// URL.")
@@ -122,6 +141,7 @@ class Downloader:
     async def controls(self, page):
         """Find explicit download controls, including controls inside frames."""
         candidates = []
+        seen_links = set()
         for frame in page.frames:
             elements = frame.locator('a, button, [role="button"], input[type="button"]')
             for element in await elements.all():
@@ -134,6 +154,12 @@ class Downloader:
                     await element.get_attribute("value"),
                 ]))
                 if DOWNLOAD_LABEL.search(label) or await element.get_attribute("download") is not None:
+                    href = await element.get_attribute("href")
+                    if href and not href.startswith(("#", "javascript:")):
+                        link = urljoin(frame.url, href)
+                        if link in seen_links:
+                            continue
+                        seen_links.add(link)
                     candidates.append((element, " ".join(label.split())[:160] or "Download file"))
         return candidates
 
@@ -154,10 +180,21 @@ class Downloader:
 
         # TronClass pages can render their controls after DOMContentLoaded.
         candidates = []
-        for _ in range(20):
+        deadline = asyncio.get_running_loop().time() + self.timeout
+        while asyncio.get_running_loop().time() < deadline:
             if not self.downloads.empty():
                 return await self.save_pending()
-            candidates = await self.controls(page)
+            try:
+                candidates = await self.controls(page)
+            except Error as exc:
+                if not any(message in str(exc) for message in (
+                    "Frame was detached", "Execution context was destroyed",
+                    "Cannot find context with specified id",
+                )):
+                    raise
+                # SSO and the activity app can replace frames while rendering.
+                await asyncio.sleep(0.25)
+                continue
             if candidates:
                 break
             await asyncio.sleep(0.25)
@@ -185,7 +222,7 @@ class Downloader:
 
 async def fill_account(page, account):
     if not account:
-        return
+        return False
     fields = page.locator(
         'input[autocomplete="username"], input[name="username"], '
         'input[name="account"], input[name="userName"], input[type="email"]'
@@ -193,50 +230,179 @@ async def fill_account(page, account):
     for field in await fields.all():
         if await field.is_visible() and await field.is_editable():
             await field.fill(account)
-            return
-    print("Enter your account in the browser; this login form was not recognized.")
+            return True
+    return False
 
 
-async def run(args):
-    site = validate_url(args.site or await prompt("Your school's TronClass login URL: "))
-    account = await prompt("Account / student ID (Enter to type it in the browser): ")
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=False)
-        try:
-            context = await browser.new_context(accept_downloads=True)
-            context.set_default_timeout(args.timeout * 1000)
-            downloader = Downloader(context, args.output, args.timeout)
-            page = await context.new_page()
+def origin(url):
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def trusted_login_url(site, login_url):
+    allowed = {origin(site)}
+    if origin(site) == "https://elearn.nsysu.edu.tw":
+        allowed.add("https://identity.nsysu.edu.tw")
+    return origin(login_url) in allowed
+
+
+async def automatic_login(page, site, account, password, timeout):
+    """Submit one login attempt, only on the requested site or NSYSU's SSO."""
+    await page.goto(site, wait_until="domcontentloaded")
+    password_field = page.locator('input[type="password"]:visible').first
+    try:
+        await password_field.wait_for(state="visible", timeout=timeout * 1000)
+    except PlaywrightTimeout:
+        raise ValueError("No supported login form found. Try --manual-login.") from None
+    if not trusted_login_url(site, page.url):
+        raise ValueError("This site's SSO provider is not configured. Use --manual-login.")
+
+    try:
+        if not await fill_account(page, account):
+            raise ValueError("Account field not recognized. Use --manual-login.")
+        await password_field.fill(password)
+        form = password_field.locator("xpath=ancestor::form").first
+        submit = form.locator('button[type="submit"], input[type="submit"]').first
+        await submit.click()
+    except Error:
+        # Playwright errors can include filled values; never expose those errors.
+        raise ValueError("Could not submit the login form. Try --manual-login.") from None
+    finally:
+        password = None
+
+    try:
+        await page.wait_for_function(
+            """expected => location.origin === expected &&
+                !Array.from(document.querySelectorAll('input[type="password"]'))
+                    .some(e => e.getClientRects().length)""",
+            arg=origin(site), timeout=timeout * 1000,
+        )
+    except PlaywrightTimeout:
+        raise ValueError(
+            "Login was not completed. Check your credentials, or use --manual-login "
+            "if verification is required. No automatic retry was attempted."
+        ) from None
+    print("Signed in.")
+
+
+async def read_credentials(manual_login, store=None, site=None, use_saved=True):
+    if not manual_login and store is not None and use_saved:
+        saved = store.load(origin(site))
+        if saved is not None:
+            print(f"Using saved account: {saved[0]}")
+            return saved
+    account = await prompt("Account / student ID: ")
+    password = None
+    if not manual_login:
+        if not account:
+            raise ValueError("An account is required for automatic login.")
+        password = await prompt("Password (hidden): ", secret=True)
+        if not password:
+            raise ValueError("A password is required for automatic login.")
+    return account, password
+
+
+async def sign_in(browser, args, site, account, password):
+    """Use a fresh context so cookies and browser storage never cross accounts."""
+    context = await browser.new_context(accept_downloads=True)
+    try:
+        context.set_default_timeout(args.timeout * 1000)
+        downloader = Downloader(context, args.output, args.timeout)
+        page = await context.new_page()
+        if args.manual_login:
             await page.goto(site, wait_until="domcontentloaded")
             await fill_account(page, account)
             print("Complete login in the browser, including your password and any verification.")
             await prompt("Once you can see your courses, press Enter here: ")
-            print("Paste a course material URL to download it. Type 'save' for a manual download, or 'quit'.")
-            while True:
-                value = await prompt("TronClass URL: ")
-                if value.lower() in {"quit", "exit", "q"}:
+        else:
+            print("Signing in...")
+            await automatic_login(page, site, account, password, args.timeout)
+            store = getattr(args, "credential_store", None)
+            if store is not None:
+                store.save(origin(site), account, password)
+        return downloader, page
+    except BaseException:
+        await context.close()
+        raise
+    finally:
+        password = None
+
+
+async def command_loop(browser, args, site, downloader, page):
+    print("Paste another URL, or type 'switch', 'forget', 'save', or 'quit'.")
+    while True:
+        value = await prompt("TronClass URL / command: ")
+        command = value.lower()
+        if command in {"quit", "exit", "q"}:
+            if downloader is not None:
+                await downloader.save_pending()
+            break
+        if not value:
+            continue
+        if command == "forget":
+            store = getattr(args, "credential_store", None) or CredentialStore()
+            store.forget(origin(site))
+            continue
+        if command in {"switch", "switch account"}:
+            try:
+                if downloader is not None:
                     await downloader.save_pending()
-                    break
-                if not value:
-                    continue
+                    await downloader.context.close()
+                downloader, page = None, None
+                print("Previous session cleared. Enter the next account for this site.")
+                account, password = await read_credentials(args.manual_login, use_saved=False)
                 try:
-                    if value.lower() == "save":
-                        await downloader.wait_for_download()
-                    else:
-                        if page.is_closed():
-                            page = await context.new_page()
-                        await downloader.open_url(page, value)
-                except PlaywrightTimeout:
-                    print("The page or download timed out. Check the browser and try again.")
-                except (Error, ValueError, OSError) as exc:
-                    print(f"Could not download: {exc}")
+                    downloader, page = await sign_in(browser, args, site, account, password)
+                finally:
+                    password = None
+                print("Account switched. Paste a material URL to download.")
+            except (Error, ValueError, OSError) as exc:
+                print(f"Could not switch accounts: {exc}")
+                print("Type 'switch' to try again, or 'quit'.")
+            continue
+        if downloader is None:
+            print("No account is signed in. Type 'switch' to sign in, or 'quit'.")
+            continue
+        try:
+            if command == "save":
+                await downloader.wait_for_download()
+            else:
+                if page.is_closed():
+                    page = await downloader.context.new_page()
+                await downloader.open_url(page, value)
+        except PlaywrightTimeout:
+            print("The page or download timed out. Check the browser and try again.")
+        except (Error, ValueError, OSError) as exc:
+            print(f"Could not download: {exc}")
+
+
+async def run(args):
+    target = validate_url(args.url or await prompt("TronClass material URL: "))
+    site = validate_url(args.site) if args.site else target
+    args.credential_store = None if args.no_remember or args.manual_login else CredentialStore()
+    account, password = await read_credentials(args.manual_login, args.credential_store, site)
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=not (args.manual_login or args.show_browser))
+        try:
+            try:
+                downloader, page = await sign_in(browser, args, site, account, password)
+            finally:
+                password = None
+            print("Downloading the requested material...")
+            # Navigate again because SSO redirects can discard the activity fragment.
+            await downloader.open_url(page, target)
+            await command_loop(browser, args, site, downloader, page)
         finally:
             await browser.close()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("url", nargs="?", help="Material URL (prompted if omitted)")
     parser.add_argument("--site", help="Your school's TronClass login URL")
+    parser.add_argument("--manual-login", action="store_true", help="Sign in manually in a visible browser")
+    parser.add_argument("--show-browser", action="store_true", help="Show the browser during automatic login and downloading")
+    parser.add_argument("--no-remember", action="store_true", help="Do not read or save remembered credentials")
     parser.add_argument("--output", type=Path, default=Path("downloads"), help="Download folder (default: downloads)")
     parser.add_argument("--timeout", type=float, default=30, help="Page/download-start timeout in seconds")
     args = parser.parse_args()

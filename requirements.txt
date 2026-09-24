@@ -1,1 +1,2 @@
 playwright>=1.49,<2
+keyring>=25,<26

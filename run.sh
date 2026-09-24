@@ -12,7 +12,7 @@ else
     exit 1
 fi
 
-if ! "$venv_python" -c 'import playwright.async_api' >/dev/null 2>&1; then
+if ! "$venv_python" -c 'import playwright.async_api; import keyring' >/dev/null 2>&1; then
     echo "Requirements are missing. Run: bash setup.sh" >&2
     exit 1
 fi
